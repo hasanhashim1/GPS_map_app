@@ -6,7 +6,6 @@ import streamlit as st
 import json
 import math
 import base64
-import time
 import urllib.request
 import os
 import io
@@ -151,8 +150,8 @@ def get_bounds(all_points):
 
     lat_range = max_lat - min_lat
     lon_range = max_lon - min_lon
-    lat_pad = max(lat_range * 0.5, 0.1)
-    lon_pad = max(lon_range * 0.5, 0.15)
+    lat_pad = max(lat_range * 0.1, 0.01)
+    lon_pad = max(lon_range * 0.1, 0.01)
 
     return {
         'min_lat': min_lat - lat_pad,
@@ -178,13 +177,11 @@ def get_required_tiles(bounds, zoom_levels):
         min_x, max_y = lat_lon_to_tile(bounds['min_lat'], bounds['min_lon'], zoom)
         max_x, min_y = lat_lon_to_tile(bounds['max_lat'], bounds['max_lon'], zoom)
 
-        # Add extra tile padding — more at lower zooms to fill the viewport
+        # Add minimal tile padding — just enough to avoid edge cutoff
         if zoom <= 8:
-            pad = 4
-        elif zoom <= 10:
-            pad = 3
+            pad = 1
         elif zoom <= 12:
-            pad = 2
+            pad = 1
         else:
             pad = 1
 
@@ -204,7 +201,7 @@ def download_tile(tile_info):
 
     try:
         req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = response.read()
             return key, base64.b64encode(data).decode('ascii')
     except Exception as e:
@@ -293,6 +290,12 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
         .info-box div {{ margin: 3px 0; }}
         .zoom-info {{ background: white; padding: 5px 10px; border-radius: 3px; box-shadow: 0 1px 5px rgba(0,0,0,0.4); font-size: 12px; font-weight: 600; }}
         .popup-label {{ font-weight: 600; color: #2c3e50; }}
+        .timeline-divider {{ width: 1px; height: 22px; background: rgba(255,255,255,0.2); flex-shrink: 0; margin: 0 4px; }}
+        .timeline-controls {{ display: flex; align-items: center; gap: 6px; margin-left: auto; }}
+        .timeline-label {{ font-size: 11px; opacity: 0.85; white-space: nowrap; }}
+        .timeline-input {{ background: rgba(0,0,0,0.35); color: white; border: 1px solid rgba(255,255,255,0.25); border-radius: 3px; padding: 1px 4px; font-size: 11px; height: 24px; color-scheme: dark; cursor: pointer; }}
+        .timeline-btn {{ background: rgba(255,255,255,0.12); color: white; border: 1px solid rgba(255,255,255,0.2); border-radius: 3px; padding: 0 10px; font-size: 11px; cursor: pointer; height: 24px; white-space: nowrap; }}
+        .timeline-btn:hover {{ background: rgba(255,255,255,0.22); }}
     </style>
 </head>
 <body>
@@ -305,6 +308,14 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
 
     <div class="controls">
         {controls_html}
+        <div class="timeline-divider"></div>
+        <div class="timeline-controls">
+            <span class="timeline-label">&#x23F1; From</span>
+            <input type="datetime-local" id="time-from" class="timeline-input">
+            <span class="timeline-label">To</span>
+            <input type="datetime-local" id="time-to" class="timeline-input">
+            <button id="time-reset" class="timeline-btn">Reset</button>
+        </div>
     </div>
 
     <div id="map"></div>
@@ -352,7 +363,9 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
 
         // Create layer groups for each event type
         var eventLayers = {{}};
+        var eventMarkers = {{}};
         var allBounds = [];
+        var allDatetimes = [];
 
         // Process each event type
         Object.keys(eventsData).forEach(function(eventKey) {{
@@ -363,6 +376,7 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
 
             var layer = L.layerGroup();
             eventLayers[eventKey] = layer;
+            eventMarkers[eventKey] = [];
 
             // Add to map by default only for GPS trackpoints
             if (eventKey === 'gps_trackpoints') {{
@@ -372,6 +386,9 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
             // Create markers for each point
             points.forEach(function(p, i) {{
                 allBounds.push([p.lat, p.lon]);
+
+                var _dt = new Date(p.datetime.replace(' ', 'T'));
+                if (!isNaN(_dt.getTime())) allDatetimes.push(_dt.getTime());
 
                 var marker = L.circleMarker([p.lat, p.lon], {{
                     radius: 7,
@@ -394,7 +411,7 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
                     return html;
                 }}());
 
-                layer.addLayer(marker);
+                eventMarkers[eventKey].push({{marker: marker, dt: _dt}});
             }});
         }});
 
@@ -403,6 +420,53 @@ def create_html_multi_events(events_data, all_event_configs, tile_cache, leaflet
             var bounds = L.latLngBounds(allBounds);
             map.fitBounds(bounds, {{padding: [40, 40]}});
         }}
+
+        // Timeline helper and filter function
+        function formatDtLocal(d) {{
+            var pad = function(n) {{ return n < 10 ? '0'+n : ''+n; }};
+            return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes());
+        }}
+
+        function applyTimeFilter() {{
+            var fromVal = document.getElementById('time-from').value;
+            var toVal = document.getElementById('time-to').value;
+            var fromTs = fromVal ? new Date(fromVal).getTime() : null;
+            var toTs = toVal ? new Date(toVal).getTime() : null;
+            Object.keys(eventMarkers).forEach(function(eventKey) {{
+                var layer = eventLayers[eventKey];
+                layer.clearLayers();
+                eventMarkers[eventKey].forEach(function(item) {{
+                    var t = item.dt.getTime();
+                    if ((fromTs === null || t >= fromTs) && (toTs === null || t <= toTs)) {{
+                        layer.addLayer(item.marker);
+                    }}
+                }});
+            }});
+        }}
+
+        // Initialize timeline inputs with data min/max datetime
+        if (allDatetimes.length > 0) {{
+            var minTs = Math.min.apply(null, allDatetimes);
+            var maxTs = Math.max.apply(null, allDatetimes);
+            document.getElementById('time-from').value = formatDtLocal(new Date(minTs));
+            document.getElementById('time-to').value = formatDtLocal(new Date(maxTs));
+        }}
+
+        // Populate all layers via filter on initial load
+        applyTimeFilter();
+
+        // Timeline event listeners
+        document.getElementById('time-from').addEventListener('change', applyTimeFilter);
+        document.getElementById('time-to').addEventListener('change', applyTimeFilter);
+        document.getElementById('time-reset').addEventListener('click', function() {{
+            if (allDatetimes.length > 0) {{
+                var minTs = Math.min.apply(null, allDatetimes);
+                var maxTs = Math.max.apply(null, allDatetimes);
+                document.getElementById('time-from').value = formatDtLocal(new Date(minTs));
+                document.getElementById('time-to').value = formatDtLocal(new Date(maxTs));
+                applyTimeFilter();
+            }}
+        }});
 
         // Setup control handlers for each event type
         Object.keys(eventLayers).forEach(function(eventKey) {{
@@ -468,15 +532,30 @@ def render_event_uploader(event_key, config, uploaded_files, csv_configs):
         f"{config['name']} CSV",
         type=['csv'],
         key=f"upload_{event_key}",
-        help=config.get('description', '')
+        help=config.get('description', ''),
+        accept_multiple_files=True
     )
     if uploaded:
         uploaded_files[event_key] = uploaded
-        file_content = uploaded.getvalue()
+        file_content = uploaded[0].getvalue()
+        if len(uploaded) > 1:
+            st.caption(f"{len(uploaded)} files selected — column mapping applied to all")
         headers = get_csv_headers(file_content)
-        preview_rows = get_csv_preview(file_content)
 
         with st.expander(f"⚙️ Configure {config['name']} columns", expanded=True):
+            if len(uploaded) > 1:
+                file_names = [f.name for f in uploaded]
+                preview_idx = st.selectbox(
+                    "Preview file",
+                    options=range(len(uploaded)),
+                    format_func=lambda i: file_names[i],
+                    key=f"preview_sel_{event_key}"
+                )
+                preview_content = uploaded[preview_idx].getvalue()
+            else:
+                preview_content = file_content
+
+            preview_rows = get_csv_preview(preview_content)
             if preview_rows:
                 st.caption("Data preview (first 5 rows)")
                 st.dataframe(preview_rows, width='stretch')
@@ -535,6 +614,14 @@ def main():
     if 'custom_events' not in st.session_state:
         st.session_state.custom_events = {}  # key -> {name, color, description}
 
+    # Initialize session state for generated map (persists across widget interactions)
+    if 'generated_html' not in st.session_state:
+        st.session_state.generated_html = None
+    if 'output_filename' not in st.session_state:
+        st.session_state.output_filename = None
+    if 'gen_meta' not in st.session_state:
+        st.session_state.gen_meta = None
+
     st.title("📍 GPS Map Generator with Multiple Event Types")
     st.markdown("Upload GPS trackpoints and various event CSVs to create a comprehensive **offline** map.")
 
@@ -565,9 +652,9 @@ def main():
         # Zoom level configuration
         st.subheader("🔍 Zoom Levels")
         st.caption("Higher max zoom = more street detail but larger file & longer generation time")
-        min_zoom = st.number_input("Min Zoom", min_value=1, max_value=14, value=6, step=1,
+        min_zoom = st.number_input("Min Zoom", min_value=1, max_value=18, value=14, step=1,
                                    help="Lower = more zoomed out view available")
-        max_zoom = st.number_input("Max Zoom", min_value=10, max_value=19, value=14, step=1,
+        max_zoom = st.number_input("Max Zoom", min_value=10, max_value=19, value=18, step=1,
                                    help="Higher = more street detail (15-17 for street names, 18-19 for buildings)")
 
         if max_zoom <= min_zoom:
@@ -708,8 +795,14 @@ def main():
             st.error("❌ Max zoom must be greater than min zoom")
             return
 
+        # Clear any previous result
+        st.session_state.generated_html = None
+        st.session_state.output_filename = None
+        st.session_state.gen_meta = None
+
         zoom_levels = list(range(min_zoom, max_zoom + 1))
 
+        st.warning("⏳ Generation in progress — do not interact with the page or it will be cancelled.")
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -721,23 +814,27 @@ def main():
             events_data = {}
             all_points_combined = []
 
-            for event_key, uploaded_file in uploaded_files.items():
-                file_content = uploaded_file.getvalue()
+            for event_key, uploaded_file_list in uploaded_files.items():
                 cfg = csv_configs[event_key]
-                points = parse_csv(
-                    file_content,
-                    cfg['datetime_col'],
-                    cfg['lat_col'],
-                    cfg['lon_col'],
-                    cfg['selected_columns'],
-                    cfg['headers']
-                )
+                all_event_points = []
+                for uploaded_file in uploaded_file_list:
+                    file_content = uploaded_file.getvalue()
+                    points = parse_csv(
+                        file_content,
+                        cfg['datetime_col'],
+                        cfg['lat_col'],
+                        cfg['lon_col'],
+                        cfg['selected_columns'],
+                        cfg['headers']
+                    )
+                    all_event_points.extend(points)
 
-                if points:
-                    events_data[event_key] = points
-                    all_points_combined.extend(points)
+                if all_event_points:
+                    events_data[event_key] = all_event_points
+                    all_points_combined.extend(all_event_points)
                     event_name = all_event_configs.get(event_key, {}).get('name', event_key)
-                    st.success(f"✅ {event_name}: {len(points)} points loaded")
+                    files_label = f"{len(uploaded_file_list)} files" if len(uploaded_file_list) > 1 else "1 file"
+                    st.success(f"✅ {event_name}: {len(all_event_points)} points loaded ({files_label})")
 
             if not all_points_combined:
                 st.error("❌ No valid points found in any CSV file!")
@@ -762,7 +859,7 @@ def main():
             tile_cache = {}
 
             tile_progress = st.empty()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(download_tile, t): t for t in tiles}
                 completed = 0
                 for future in as_completed(futures):
@@ -774,7 +871,6 @@ def main():
                     if completed % 20 == 0 or completed == len(tiles):
                         tile_progress.text(f"Downloading: {completed:,}/{len(tiles):,} ({100*completed//len(tiles)}%)")
                         progress_bar.progress(25 + int(55 * completed / len(tiles)))
-                    time.sleep(0.05)
 
             st.success(f"✅ Successfully downloaded {len(tile_cache):,} tiles")
             progress_bar.progress(80)
@@ -801,41 +897,51 @@ def main():
             output_filename = f"Map_Events_{case_number}_{item_number}.html"
             output_filename = "".join(c for c in output_filename if c not in '<>:"/\\|?*')
 
-            # Display results
-            st.success("🎉 Offline map generated successfully!")
-
-            # Stats
-            stat_cols = st.columns(len(events_data) + 2)
-            for idx, (event_key, points) in enumerate(events_data.items()):
-                with stat_cols[idx]:
-                    event_name = all_event_configs.get(event_key, {}).get('name', event_key)
-                    st.metric(event_name, f"{len(points):,}")
-
-            with stat_cols[-2]:
-                st.metric("🗺️ Map Tiles", f"{len(tile_cache):,}")
-            with stat_cols[-1]:
-                file_size_mb = len(html.encode('utf-8')) / (1024 * 1024)
-                st.metric("💾 File Size", f"{file_size_mb:.1f} MB")
-
-            # Download button
-            st.divider()
-            col1, col2, col3 = st.columns([1, 2, 1])
-            with col2:
-                st.download_button(
-                    label="⬇️ Download Offline Map with Events (HTML)",
-                    data=html,
-                    file_name=output_filename,
-                    mime="text/html",
-                    type="primary",
-                    width='stretch'
-                )
-
-            st.info(f"🌍 This file works 100% OFFLINE! Zoom range: {min_zoom}-{max_zoom}. Open in any browser — no internet needed!")
+            # Store result in session state so it survives widget interactions
+            file_size_mb = len(html.encode('utf-8')) / (1024 * 1024)
+            st.session_state.generated_html = html
+            st.session_state.output_filename = output_filename
+            st.session_state.gen_meta = {
+                'events': {k: len(v) for k, v in events_data.items()},
+                'tile_count': len(tile_cache),
+                'file_size_mb': file_size_mb,
+                'min_zoom': min_zoom,
+                'max_zoom': max_zoom,
+                'all_event_configs': all_event_configs
+            }
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
             import traceback
             st.code(traceback.format_exc())
+
+    # Show download section from session state — persists across widget interactions
+    if st.session_state.get('generated_html'):
+        meta = st.session_state.gen_meta
+        st.success("🎉 Offline map generated successfully!")
+
+        stat_cols = st.columns(len(meta['events']) + 2)
+        for idx, (event_key, count) in enumerate(meta['events'].items()):
+            with stat_cols[idx]:
+                event_name = meta['all_event_configs'].get(event_key, {}).get('name', event_key)
+                st.metric(event_name, f"{count:,}")
+        with stat_cols[-2]:
+            st.metric("🗺️ Map Tiles", f"{meta['tile_count']:,}")
+        with stat_cols[-1]:
+            st.metric("💾 File Size", f"{meta['file_size_mb']:.1f} MB")
+
+        st.divider()
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.download_button(
+                label="⬇️ Download Offline Map with Events (HTML)",
+                data=st.session_state.generated_html,
+                file_name=st.session_state.output_filename,
+                mime="text/html",
+                type="primary",
+                width='stretch'
+            )
+        st.info(f"🌍 This file works 100% OFFLINE! Zoom range: {meta['min_zoom']}-{meta['max_zoom']}. Open in any browser — no internet needed!")
 
 
 if __name__ == "__main__":
